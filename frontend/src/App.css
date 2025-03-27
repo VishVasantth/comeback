@@ -11,4 +11,16 @@
 .buttons {
   display: flex;
   flex-wrap: wrap;
+}
+
+/* Hide default left-side zoom controls */
+.leaflet-control-zoom-in,
+.leaflet-control-zoom-out,
+.leaflet-control-zoom {
+  display: none !important;
+}
+
+/* Only show the custom zoom control we've added */
+.leaflet-control-zoom[style*="right"] {
+  display: block !important;
 } 

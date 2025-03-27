@@ -1,11 +1,13 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { MapContainer, TileLayer, Marker, Polyline, useMap } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, Polyline, useMap, ZoomControl } from 'react-leaflet';
 import axios from 'axios';
 import './App.css';
+import L from 'leaflet';
 
 // Config
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || 'http://localhost:5000';
 const DETECTION_URL = process.env.REACT_APP_DETECTION_URL || 'http://localhost:5001';
+const OPENROUTE_API_KEY = process.env.REACT_APP_OPENROUTE_API_KEY || '5b3ce3597851110001cf624812256828f10d48cc9929ad72e81328be';
 const DEFAULT_CENTER = [10.903831, 76.899839]; // Arjuna Statue at Amrita
 
 // Amrita campus locations
@@ -51,13 +53,57 @@ function MapUpdater({ path }) {
   const map = useMap();
   
   useEffect(() => {
-    if (path && path.length > 0) {
-      map.fitBounds(path);
+    if (path && path.length > 1) {
+      try {
+        console.log("Fitting map to path:", path);
+        
+        // Create Leaflet LatLng objects for the bounds
+        const bounds = path.reduce(
+          (bounds, point) => {
+            // Convert point to LatLng if it's an array
+            const latLng = Array.isArray(point) 
+              ? L.latLng(point[0], point[1]) 
+              : L.latLng(point.lat, point.lng);
+            return bounds.extend(latLng);
+          },
+          L.latLngBounds(path[0], path[0])
+        );
+        
+        // Add a small padding
+        map.fitBounds(bounds, { padding: [50, 50] });
+      } catch (error) {
+        console.error("Error fitting bounds:", error);
+      }
     }
   }, [path, map]);
   
   return null;
 }
+
+// Function to find the closest point on a path to a given point
+const findClosestPointOnPath = (point, path) => {
+  let closestPoint = null;
+  let minDistance = Infinity;
+  
+  // Convert point to [lat, lng] format if it's not already
+  const targetPoint = Array.isArray(point) 
+    ? point 
+    : [point.lat, point.lng];
+  
+  path.forEach(pathPoint => {
+    // Calculate distance using Pythagorean theorem (simplified for small distances)
+    const latDiff = pathPoint[0] - targetPoint[0];
+    const lngDiff = pathPoint[1] - targetPoint[1];
+    const distance = Math.sqrt(latDiff * latDiff + lngDiff * lngDiff);
+    
+    if (distance < minDistance) {
+      minDistance = distance;
+      closestPoint = pathPoint;
+    }
+  });
+  
+  return closestPoint;
+};
 
 function App() {
   // State for coordinates
@@ -81,6 +127,7 @@ function App() {
   const [route, setRoute] = useState(null);
   const [rerouting, setRerouting] = useState(false);
   const [error, setError] = useState(null);
+  const [simulationActive, setSimulationActive] = useState(false);
   
   // State for detection service
   const [detectionRunning, setDetectionRunning] = useState(false);
@@ -90,87 +137,72 @@ function App() {
   const videoRef = useRef(null);
   const frameIntervalRef = useRef(null);
   
+  // State for closest points on path to markers
+  const [startPathPoint, setStartPathPoint] = useState(null);
+  const [endPathPoint, setEndPathPoint] = useState(null);
+  
   // Function to find path between two points
   const findPath = async (start, end) => {
     try {
       setRerouting(true);
       
       // Set markers
-      setStartMarker({ position: { lat: parseFloat(start.lat), lng: parseFloat(start.lng) }, label: 'A' });
-      setEndMarker({ position: { lat: parseFloat(end.lat), lng: parseFloat(end.lng) }, label: 'B' });
+      setStartMarker({ position: { lat: parseFloat(start.lat), lng: parseFloat(start.lng || start.lon) }, label: 'A' });
+      setEndMarker({ position: { lat: parseFloat(end.lat), lng: parseFloat(end.lng || end.lon) }, label: 'B' });
 
       console.log(`Finding path from ${JSON.stringify(start)} to ${JSON.stringify(end)}...`);
       
-      // Try up to 3 times to get a path from the server
-      let attempts = 0;
-      let maxAttempts = 3;
-      let pathResult = null;
+      // Use OpenRouteService API for routing
+      const url = `https://api.openrouteservice.org/v2/directions/foot-walking?api_key=${OPENROUTE_API_KEY}&start=${start.lon || start.lng},${start.lat}&end=${end.lon || end.lng},${end.lat}`;
       
-      while (attempts < maxAttempts && !pathResult) {
-        attempts++;
-        console.log(`Attempt ${attempts} to find path...`);
+      console.log(`Requesting route from OpenRouteService: ${url}`);
+      
+      try {
+        const response = await fetch(url);
+        const data = await response.json();
         
-        try {
-          // Set a timeout of 10 seconds for the fetch
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 10000);
+        if (data.features && data.features.length > 0) {
+          console.log("Route data received:", data);
           
-          const response = await fetch(`${BACKEND_URL}/find_path`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              start: start.name || 'custom_location',
-              end: end.name || 'custom_location',
-              start_coords: [start.gridX || 0, start.gridY || 0],
-              end_coords: [end.gridX || 0, end.gridY || 0]
-            }),
-            signal: controller.signal
+          // Convert coordinates from [lon, lat] to [lat, lon] for map display
+          const coords = data.features[0].geometry.coordinates;
+          const pathCoordinates = coords.map(coord => [coord[1], coord[0]]);
+          
+          // Calculate distance and time from the API response
+          const distance = data.features[0].properties.summary.distance; // in meters
+          const duration = data.features[0].properties.summary.duration; // in seconds
+          
+          // Set the route data
+          setRoute({
+            path: pathCoordinates.map(coord => ({ lat: coord[0], lng: coord[1] })),
+            distance: distance,
+            time: duration / 60, // Convert to minutes
+            coordinates: coords
           });
           
-          clearTimeout(timeoutId);
+          // Set the path for visualization on the map
+          console.log("Setting path with coordinates:", pathCoordinates);
+          setPath(pathCoordinates);
           
-          if (!response.ok) {
-            const errorData = await response.json();
-            console.error(`Server error: ${errorData.error}`);
-            throw new Error(errorData.error || 'Server error');
+          // Add waypoints for intermediate points (every 3 points)
+          const waypoints = [];
+          for (let i = 1; i < pathCoordinates.length - 1; i += 3) {
+            waypoints.push({
+              position: { lat: pathCoordinates[i][0], lng: pathCoordinates[i][1] },
+              label: `${Math.floor(i/3) + 1}`,
+              name: `Waypoint ${Math.floor(i/3) + 1}`
+            });
           }
+          setWaypoints(waypoints);
           
-          pathResult = await response.json();
-          console.log("Path found:", pathResult);
-        } catch (err) {
-          console.error(`Attempt ${attempts} failed:`, err);
-          
-          // If this was the last attempt, we'll use the fallback
-          if (attempts >= maxAttempts) {
-            console.log("Using direct path fallback");
-          } else {
-            // Wait a moment before the next attempt
-            await new Promise(resolve => setTimeout(resolve, 1000));
-          }
+        } else {
+          console.error("Invalid response from OpenRouteService:", data);
+          throw new Error("Could not get route from OpenRouteService");
         }
-      }
-      
-      // If we have a path result from the server, use it
-      if (pathResult) {
-        const pathCoordinates = pathResult.coordinates.map(coord => ({
-          lat: parseFloat(coord.lat),
-          lng: parseFloat(coord.lng)
-        }));
+      } catch (error) {
+        console.error("Error fetching route from OpenRouteService:", error);
         
-        setRoute({
-          path: pathCoordinates,
-          distance: pathResult.distance,
-          time: pathResult.estimated_time
-        });
-        
-        // Add intermediate markers
-        setWaypoints(pathResult.coordinates.slice(1, -1).map((coord, idx) => ({
-          position: { lat: parseFloat(coord.lat), lng: parseFloat(coord.lng) },
-          label: `${idx + 1}`,
-          name: coord.name
-        })));
-      } else {
-        // Create a direct path as fallback
+        // Fall back to direct path if API fails
         createDirectPath(start, end);
       }
     } catch (error) {
@@ -188,15 +220,25 @@ function App() {
   
   // Function to create a direct path between two points
   const createDirectPath = (start, end) => {
+    console.log("Creating direct path with:", { start, end });
+    
+    // Validate inputs to prevent errors
+    if (!start || !end) {
+      console.error("Invalid inputs to createDirectPath:", { start, end });
+      return;
+    }
+    
     const startPoint = { 
-      lat: parseFloat(start.lat), 
-      lng: parseFloat(start.lng) 
+      lat: parseFloat(start.lat || 0), 
+      lng: parseFloat(start.lng || start.lon || 0) 
     };
     
     const endPoint = { 
-      lat: parseFloat(end.lat), 
-      lng: parseFloat(end.lng) 
+      lat: parseFloat(end.lat || 0), 
+      lng: parseFloat(end.lng || end.lon || 0) 
     };
+    
+    console.log("Parsed points:", { startPoint, endPoint });
     
     // Create a simple path with a few interpolated points
     const pathCoordinates = [
@@ -238,6 +280,12 @@ function App() {
       time: estimatedTime,
       isDirectPath: true
     });
+    
+    // Set the path for visualization on the map
+    console.log("Setting path with coordinates:", pathCoordinates);
+    const mapPath = pathCoordinates.map(coord => [coord.lat, coord.lng]);
+    console.log("Map path format:", mapPath);
+    setPath(mapPath);
     
     // Add waypoints for the intermediate points
     setWaypoints(pathCoordinates.slice(1, -1).map((coord, idx) => ({
@@ -345,6 +393,8 @@ function App() {
       return;
     }
     
+    setSimulationActive(true);
+    
     // Initialize the simulation at the first point
     let currentIndex = 0;
     
@@ -355,6 +405,7 @@ function App() {
       // If we reached the end, stop the simulation
       if (currentIndex >= path.length) {
         clearInterval(interval);
+        setSimulationActive(false);
         return;
       }
       
@@ -373,6 +424,26 @@ function App() {
       }
     }, 1000); // Move every 1 second
   };
+  
+  // Update closest points whenever path or markers change
+  useEffect(() => {
+    if (path.length > 0 && startMarker && endMarker) {
+      // Find closest point on path to start marker
+      const closestToStart = findClosestPointOnPath(
+        [startMarker.position.lat, startMarker.position.lng], 
+        path
+      );
+      
+      // Find closest point on path to end marker
+      const closestToEnd = findClosestPointOnPath(
+        [endMarker.position.lat, endMarker.position.lng], 
+        path
+      );
+      
+      setStartPathPoint(closestToStart);
+      setEndPathPoint(closestToEnd);
+    }
+  }, [path, startMarker, endMarker]);
   
   return (
     <div className="app">
@@ -435,7 +506,22 @@ function App() {
         </div>
         
         <div className="buttons">
-          <button onClick={findPath}>Find Path</button>
+          <button onClick={() => {
+            // Create start and end objects from the current values
+            const start = {
+              lat: startLat,
+              lng: startLon,
+              lon: startLon,
+              name: startLocation
+            };
+            const end = {
+              lat: endLat,
+              lng: endLon,
+              lon: endLon,
+              name: endLocation
+            };
+            findPath(start, end);
+          }}>Find Path</button>
           <button onClick={simulateMovement}>Simulate Movement</button>
           {!detectionRunning ? (
             <button onClick={startDetection}>Start Detection</button>
@@ -450,11 +536,22 @@ function App() {
         zoom={17} 
         maxZoom={19}
         minZoom={15}
+        zoomControl={false}
         maxBounds={[
-          [10.89, 76.89], // Southwest corner
-          [10.91, 76.91]  // Northeast corner
+          [10.897, 76.894], // Southwest corner
+          [10.910, 76.905]  // Northeast corner
         ]}
         maxBoundsViscosity={1.0}
+        whenReady={(map) => {
+          // Add a drag event to keep the map within bounds
+          map.target.on('drag', () => {
+            const bounds = L.latLngBounds(
+              [10.897, 76.894],
+              [10.910, 76.905]
+            );
+            map.target.panInsideBounds(bounds, { animate: false });
+          });
+        }}
         style={{ height: '100vh', width: '100vw' }}
       >
         <TileLayer
@@ -462,13 +559,60 @@ function App() {
           attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
         />
         
+        {/* Add zoom control on the right side */}
+        <ZoomControl position="topright" />
+        
         {/* Show path if available */}
         {path.length > 0 && (
-          <Polyline positions={path} color="blue" weight={4} />
+          <>
+            <Polyline positions={path} color="blue" weight={4} />
+            
+            {/* Connect start marker to the closest point on path with dotted line */}
+            {startMarker && startPathPoint && (
+              <Polyline 
+                positions={[
+                  [startMarker.position.lat, startMarker.position.lng],
+                  startPathPoint
+                ]} 
+                color="blue" 
+                weight={3} 
+                dashArray="5, 10" 
+              />
+            )}
+            
+            {/* Connect end marker to the closest point on path with dotted line */}
+            {endMarker && endPathPoint && (
+              <Polyline 
+                positions={[
+                  [endMarker.position.lat, endMarker.position.lng],
+                  endPathPoint
+                ]} 
+                color="blue" 
+                weight={3} 
+                dashArray="5, 10" 
+              />
+            )}
+          </>
         )}
         
-        {/* Show current location */}
-        <Marker position={currentLocation} />
+        {/* Show start marker */}
+        {startMarker && (
+          <Marker 
+            position={[startMarker.position.lat, startMarker.position.lng]} 
+            title="Start"
+          />
+        )}
+        
+        {/* Show end marker */}
+        {endMarker && (
+          <Marker 
+            position={[endMarker.position.lat, endMarker.position.lng]} 
+            title="End"
+          />
+        )}
+        
+        {/* Show current location only during simulation */}
+        {simulationActive && <Marker position={currentLocation} />}
         
         {/* Update map view when path changes */}
         <MapUpdater path={path} />
